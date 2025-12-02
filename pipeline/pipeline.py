@@ -1,44 +1,68 @@
 import os
 import boto3
-from sagemaker.model import Model
 from sagemaker.workflow.parameters import ParameterString, ParameterFloat
+from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.pipeline import Pipeline
-from sagemaker.workflow.steps import ProcessingStep, TrainingStep, CacheConfig
-from sagemaker.workflow.step_collections import RegisterModel
-from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
-from sagemaker.workflow.condition_step import ConditionStep
-from sagemaker.processing import ScriptProcessor, ProcessingInput, ProcessingOutput
+
+from sagemaker.processing import ProcessingInput, ProcessingOutput, ScriptProcessor
 from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.estimator import Estimator
 from sagemaker.inputs import TrainingInput
-from sagemaker.model_metrics import MetricsSource, ModelMetrics
-from sagemaker.workflow.pipeline_context import PipelineSession
+from sagemaker.model import Model
+from sagemaker.model_metrics import ModelMetrics, MetricsSource
+from sagemaker.workflow.properties import PropertyFile
+from sagemaker.workflow.step_collections import RegisterModel
+from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
 from sagemaker.workflow.functions import JsonGet
-from sagemaker.workflow.properties import PropertyFile  # Added for evaluation.json par
-# for sagemaker execution
-region = boto3.Session().region_name
-pipeline_session = PipelineSession()
+from sagemaker.workflow.condition_step import ConditionStep
+from sagemaker.workflow.steps import ProcessingStep, TrainingStep
+from sagemaker import image_uris
 
 
-# for CICD execution
-# region = os.environ.get("AWS_REGION", "us-east-1")
-# boto_session = boto3.Session(region_name=region)
-# pipeline_session = PipelineSession(boto_session=boto_session)
+# ======================================================================================
+# 🔧 1. Session + Role + Region Setup
+# ======================================================================================
+
+region = os.environ.get("AWS_REGION", boto3.Session().region_name)
+boto_sess = boto3.Session(region_name=region)
+pipeline_session = PipelineSession(boto_session=boto_sess)
+
+# CI/CD variable (GitHub Actions)
+role = os.environ.get("SAGEMAKER_ROLE_ARN")
+if role is None:
+    raise ValueError("❌ SAGEMAKER_ROLE_ARN environment variable not provided.")
+
+bucket = os.environ.get("S3_BUCKET")
+if bucket is None:
+    raise ValueError("❌ S3_BUCKET env variable is missing.")
+
+prefix = "sagemaker-churn-mlops"
 
 
-role = "sagemaker-execution-role"  # Please enter your role here
+# ======================================================================================
+# 🔧 2. Pipeline Parameters
+# ======================================================================================
+
+input_data = ParameterString(
+    name="InputData",
+    default_value=f"s3://{bucket}/{prefix}/raw/churn.csv"
+)
+
+model_approval = ParameterString(
+    name="ModelApprovalStatus",
+    default_value="PendingManualApproval"
+)
+
+accuracy_threshold = ParameterFloat(
+    name="AccuracyThreshold",
+    default_value=0.50
+)
 
 
-# -----------------------------
-# Pipeline Parameters
-# -----------------------------
-input_data = ParameterString(name="InputData", default_value="s3://sagemaker-churn-mlops-ka/sagemaker-churn-mlops/raw/churn.csv")
-model_approval = ParameterString(name="ModelApprovalStatus", default_value="PendingManualApproval")
-accuracy_threshold = ParameterFloat(name="AccuracyThreshold", default_value=0.50)
+# ======================================================================================
+# 🔧 3. Step 1 — Processing Step
+# ======================================================================================
 
-# -----------------------------
-# Step 1: Preprocessing
-# -----------------------------
 sklearn_processor = SKLearnProcessor(
     framework_version="1.2-1",
     role=role,
@@ -58,30 +82,31 @@ processing_step = ProcessingStep(
         )
     ],
     outputs=[
-        ProcessingOutput(
-            output_name="train",
-            source="/opt/ml/processing/train"
-        ),
-        ProcessingOutput(
-            output_name="test",
-            source="/opt/ml/processing/test"
-        )
+        ProcessingOutput(output_name="train", source="/opt/ml/processing/train"),
+        ProcessingOutput(output_name="test", source="/opt/ml/processing/test")
     ],
-    code="src/preprocessing.py"
+    code="src/preprocessing.py",
 )
 
-# -----------------------------
-# Step 2: Training
-# -----------------------------
+
+# ======================================================================================
+# 🔧 4. Step 2 — Training Step (Script Mode XGBoost)
+# ======================================================================================
+
+xgb_image = image_uris.retrieve(
+    framework="xgboost",
+    region=region,
+    version="1.5-1",
+)
+
 estimator = Estimator(
     entry_point="src/train.py",
     role=role,
     instance_type="ml.m5.large",
     instance_count=1,
+    image_uri=xgb_image,
+    sagemaker_session=pipeline_session,
     base_job_name="churn-train",
-    image_uri="683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.3-1",
-    py_version="py3",
-    sagemaker_session=pipeline_session
 )
 
 training_step = TrainingStep(
@@ -95,27 +120,21 @@ training_step = TrainingStep(
     }
 )
 
-model = Model(
-    image_uri="683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.5-1",
-    model_data=training_step.properties.ModelArtifacts.S3ModelArtifacts,
-    role=role,
-    sagemaker_session=pipeline_session
-)
 
-# -----------------------------
-# Step 3: Evaluation
-# -----------------------------
-script_eval = ScriptProcessor(
-    image_uri="683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.5-1",
-    command=["python3"],
+# ======================================================================================
+# 🔧 5. Step 3 — Evaluation Step
+# ======================================================================================
+
+evaluation_processor = ScriptProcessor(
     role=role,
+    image_uri=xgb_image,
+    command=["python3"],
     instance_type="ml.t3.medium",
     instance_count=1,
     base_job_name="churn-eval",
     sagemaker_session=pipeline_session,
 )
 
-# ✅ PropertyFile to extract accuracy
 evaluation_report = PropertyFile(
     name="evaluation",
     output_name="evaluation",
@@ -124,7 +143,7 @@ evaluation_report = PropertyFile(
 
 eval_step = ProcessingStep(
     name="EvaluateStep",
-    processor=script_eval,
+    processor=evaluation_processor,
     code="src/evaluate.py",
     inputs=[
         ProcessingInput(
@@ -134,17 +153,26 @@ eval_step = ProcessingStep(
         ProcessingInput(
             source=processing_step.properties.ProcessingOutputConfig.Outputs["test"].S3Output.S3Uri,
             destination="/opt/ml/processing/test"
-        ),
+        )
     ],
     outputs=[
         ProcessingOutput(output_name="evaluation", source="/opt/ml/processing/evaluation")
     ],
-    property_files=[evaluation_report]  # ✅ Add this line
+    property_files=[evaluation_report]
 )
 
-# -----------------------------
-# Step 4: Conditional Model Registration
-# -----------------------------
+
+# ======================================================================================
+# 🔧 6. Step 4 — Register Model Step
+# ======================================================================================
+
+model = Model(
+    image_uri=xgb_image,
+    model_data=training_step.properties.ModelArtifacts.S3ModelArtifacts,
+    role=role,
+    sagemaker_session=pipeline_session,
+)
+
 model_metrics = ModelMetrics(
     model_statistics=MetricsSource(
         s3_uri=eval_step.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri,
@@ -155,16 +183,18 @@ model_metrics = ModelMetrics(
 register_step = RegisterModel(
     name="RegisterModel",
     model=model,
-    model_data=training_step.properties.ModelArtifacts.S3ModelArtifacts,
     content_types=["text/csv"],
     response_types=["text/csv"],
     model_package_group_name="ChurnXGBModelGroup",
     approval_status=model_approval,
     model_metrics=model_metrics,
-    sagemaker_session=pipeline_session,
 )
 
-# ✅ Fix ConditionStep using JsonGet
+
+# ======================================================================================
+# 🔧 7. Condition Step (Check Accuracy >= Threshold)
+# ======================================================================================
+
 cond_step = ConditionStep(
     name="CheckAccuracy",
     conditions=[
@@ -174,19 +204,31 @@ cond_step = ConditionStep(
                 property_file="evaluation",
                 json_path="accuracy"
             ),
-            right=accuracy_threshold
+            right=accuracy_threshold,
         )
     ],
     if_steps=[register_step],
-    else_steps=[]
+    else_steps=[],
 )
 
-# -----------------------------
-# Create Pipeline
-# -----------------------------
+
+# ======================================================================================
+# 🔧 8. Build Pipeline
+# ======================================================================================
+
 pipeline = Pipeline(
     name="ChurnXGBPipeline",
     parameters=[input_data, model_approval, accuracy_threshold],
     steps=[processing_step, training_step, eval_step, cond_step],
     sagemaker_session=pipeline_session,
 )
+
+
+if __name__ == "__main__":
+    print("💡 Creating/Updating SageMaker Pipeline...")
+    pipeline.upsert(role_arn=role)
+    print("🚀 Executing SageMaker Pipeline...")
+    execution = pipeline.start()
+    print("⏳ Waiting for completion...")
+    execution.wait()
+    print("✅ Pipeline execution completed successfully!")
